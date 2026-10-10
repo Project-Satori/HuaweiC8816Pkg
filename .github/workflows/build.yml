@@ -1,0 +1,165 @@
+name: Build Huawei C8816 UEFI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c8816-uefi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: EDK2 ARM / GCC5 / Linaro GCC 7.4.1
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      # Keep this checkout separate: the package is staged under edk2/Lumia535Pkg
+      # because its DSC/FDF files still use the upstream Lumia535Pkg path.
+      - name: Checkout HuaweiC8816Pkg source
+        uses: actions/checkout@v4
+        with:
+          path: package-source
+          submodules: recursive
+
+      # Lumia-EDK2-Guide documents this EDK2 revision as a known-working baseline.
+      - name: Checkout EDK2 baseline
+        uses: actions/checkout@v4
+        with:
+          repository: tianocore/edk2
+          ref: a2c3bf1f2f991614ac97ddcf4b31742e4366c3a5
+          path: edk2
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            git \
+            make \
+            nasm \
+            acpica-tools \
+            uuid-dev \
+            libssl-dev \
+            liblzma-dev \
+            rsync \
+            xz-utils \
+            curl
+
+      # Ubuntu 22.04 runner images cache PyPy 3.8 (but not CPython 3.8).
+      # PyPy 3.8 retains the Python 3.8 array API required by this old BaseTools.
+      - name: Set up cached PyPy 3.8
+        id: python38
+        uses: actions/setup-python@v5
+        with:
+          python-version: 'pypy3.8'
+
+      # Force both `python` and `python3` to use the selected PyPy, even if
+      # later EDK2 scripts invoke a specific command name through /usr/bin/env.
+      - name: Select Python 3.8 for EDK2
+        shell: bash
+        env:
+          PYTHON38: ${{ steps.python38.outputs.python-path }}
+        run: |
+          "$PYTHON38" --version
+          "$PYTHON38" -c 'import array, sys; print(sys.executable); assert sys.version_info[:2] == (3, 8); assert hasattr(array.array("B"), "tostring"), "array.tostring() missing"'
+          mkdir -p "$RUNNER_TEMP/python38-bin"
+          for name in python python3 python3.8; do
+            cat > "$RUNNER_TEMP/python38-bin/$name" <<EOF
+          #!/usr/bin/env bash
+          exec "$PYTHON38" "\$@"
+          EOF
+            chmod +x "$RUNNER_TEMP/python38-bin/$name"
+          done
+          echo "$RUNNER_TEMP/python38-bin" >> "$GITHUB_PATH"
+          echo "PYTHON_COMMAND=$PYTHON38" >> "$GITHUB_ENV"
+
+      - name: Initialize EDK2 submodules and stage platform package
+        shell: bash
+        run: |
+          git -C edk2 submodule sync --recursive
+          git -C edk2 submodule update --init --recursive
+
+          mkdir -p edk2/Lumia535Pkg
+          rsync -a --delete --exclude='.git/' package-source/ edk2/Lumia535Pkg/
+          test -f edk2/Lumia535Pkg/Lumia535.dsc
+          test -f edk2/Lumia535Pkg/Lumia535.fdf
+          test -f edk2/Lumia535Pkg/FvWrapper.ld
+
+      - name: Build EDK2 BaseTools
+        working-directory: edk2
+        run: |
+          command -v python
+          command -v python3
+          python --version
+          python3 --version
+          python3 -c 'import array, sys; print(sys.executable); assert sys.version_info[:2] == (3, 8); assert hasattr(array.array("B"), "tostring")'
+          make -C BaseTools EXTRA_OPTFLAGS="-Wno-error=vla-parameter"
+
+      - name: Download Linaro ARM GCC 7.4.1
+        shell: bash
+        run: |
+          TOOLCHAIN_ARCHIVE='gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf.tar.xz'
+          TOOLCHAIN_DIR='gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf'
+          TOOLCHAIN_URL="https://developer.arm.com/-/cdn-downloads/permalink/legacy-linaro-gnu-toolchains/7.5-2019.12/${TOOLCHAIN_ARCHIVE}"
+          TOOLCHAIN_MD5='bf34cd568a180a861a954379f74edbb9'
+
+          curl --fail --location --retry 3 --retry-delay 2 \
+            "$TOOLCHAIN_URL" --output "$RUNNER_TEMP/$TOOLCHAIN_ARCHIVE"
+          echo "${TOOLCHAIN_MD5}  $RUNNER_TEMP/$TOOLCHAIN_ARCHIVE"
+          tar -xJf "$RUNNER_TEMP/$TOOLCHAIN_ARCHIVE" -C "$RUNNER_TEMP"
+
+          echo "LINARO_BIN=$RUNNER_TEMP/$TOOLCHAIN_DIR/bin" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/$TOOLCHAIN_DIR/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/$TOOLCHAIN_DIR/bin/arm-linux-gnueabihf-gcc" --version
+          "$RUNNER_TEMP/$TOOLCHAIN_DIR/bin/arm-linux-gnueabihf-ld" --version
+
+      - name: Build Lumia535-based C8816 firmware
+        working-directory: edk2
+        shell: bash
+        run: |
+          source edksetup.sh
+          export GCC5_ARM_PREFIX="${LINARO_BIN}/arm-linux-gnueabihf-"
+
+          # The package is a Lumia535Pkg fork, so keep the upstream DSC path and GCC5 tag.
+          build \
+            -a ARM \
+            -p Lumia535Pkg/Lumia535.dsc \
+            -t GCC5 \
+            -b DEBUG \
+            -n 0
+
+      - name: Wrap firmware volume as emmc_appsboot.mbn
+        working-directory: edk2
+        shell: bash
+        run: |
+          FV_DIR="$GITHUB_WORKSPACE/edk2/Build/Lumia535-ARM/DEBUG_GCC5/FV"
+          test -s "$FV_DIR/MSM8612_EFI.fd"
+          cd "$FV_DIR"
+
+          "${LINARO_BIN}/arm-linux-gnueabihf-objcopy" \
+            -I binary -O elf32-littlearm --binary-architecture arm \
+            MSM8612_EFI.fd MSM8612_EFI.fd.elf
+          "${LINARO_BIN}/arm-linux-gnueabihf-ld" \
+            MSM8612_EFI.fd.elf \
+            -T "$GITHUB_WORKSPACE/edk2/Lumia535Pkg/FvWrapper.ld" \
+            -o emmc_appsboot.mbn
+
+          file MSM8612_EFI.fd MSM8612_EFI.fd.elf emmc_appsboot.mbn
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: HuaweiC8816Pkg-UEFI-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            edk2/Build/Lumia535-ARM/DEBUG_GCC5/FV/MSM8612_EFI.fd
+            edk2/Build/Lumia535-ARM/DEBUG_GCC5/FV/MSM8612_EFI.fd.elf
+            edk2/Build/Lumia535-ARM/DEBUG_GCC5/FV/emmc_appsboot.mbn
